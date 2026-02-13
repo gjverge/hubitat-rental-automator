@@ -1,3 +1,72 @@
+This is a fork of the https://github.com/TheDanHealy/hubitat-rental-automator lock automation code for Hubitat written in Groovy. Like the origonal author I was a user of Rboy lock apps on Smartthings until they droped support for Groovy apps without usable warning or a replacement. I switched to Hubitat and was looking for a solution when I found this project that did the core of what I needed but was missing some features that were required for my use case. The main item being that I use OwnerRez as my aggregation platform and needed to be able to parse its ical format. I added ical parsing details in the app configuration page. The new ical parsing makes it easy to support multiple ical formats and VRBO is an obvious addition but I don't have access to a VRBO system to properly configure and test its ical format. I also wanted to make operation as robust as possible as I often get short internet outages that may block ical fetches at the instant of lock change times. I started with just this minor ical change but have steadily been improving it and now it is ready to be shared with others. 
+
+# What Changed vs. the original Rental Automator
+This is a ground-up rewrite of Dan Healy's original `rental-automator.groovy`. The core concept is the same -- automatically program door lock codes and switch Hubitat modes based on an iCal calendar feed -- but nearly every subsystem has been reworked. Here is a detailed summary of the changes.
+
+## OwnerRez Calendar Support
+The original app only supported AirBNB iCal feeds. This version adds full OwnerRez support. A new **Calendar Format** dropdown lets you choose between AirBNB and OwnerRez. Each format has its own dedicated parser (`parseAirBNBCalendar` / `parseOwnerRezCalendar`) behind a common `parseCalendarData` dispatcher. OwnerRez events use `STATUS: CONFIRMED` (instead of `SUMMARY: Reserved`), `DoorCode` and `FirstName` custom fields, and a datetime format (`yyyyMMdd'T'HHmmss`) that carries exact check-in/check-out times. The restructuring makes it easy to add other custom ical parsers like for VRBO but as I don't have access to a VRBO ical version I did not add that support.
+
+## Exact-Time Scheduling (OwnerRez)
+When using OwnerRez with the **"Use OwnerRez times"** toggle enabled, the app schedules check-in and check-out at the exact times embedded in the booking rather than using a fixed daily time. A 15-minute polling loop (`pollIcalForUpdates`) watches for time changes (e.g., early check-in or late check-out granted by the host) and automatically reschedules. If the scheduled time has already passed when the app is enabled, it executes the procedure immediately.
+
+## Check-In / Check-Out Time Offsets
+Two new settings -- **checkinEarlyMinutes** (0-60) and **checkoutLateMinutes** (0-60) -- let you shift the scheduled procedures earlier or later without changing the actual check-in/check-out times. This was a Rboy app feature that I used heavily.
+
+## Multi-Booking Support
+The original code looked for a single check-in or check-out event per day. RentalLock uses `findAllCheckinEvents` and `findAllCheckoutEvents` to return lists, so multiple bookings starting or ending on the same day are each processed. Warnings and notifications are sent when overlapping bookings are detected.
+
+## Retry Logic Overhaul
+The original inline retry loop ran up to 10 times with a fixed 10-second pause. RentalLock replaces this with a generic `attemptWithRetry` wrapper used by both `attemptProgramLock` (3 retries, 10s delay) and `attemptDeleteLock` (3 retries, 10s delay). Each attempt is verified by reading back the lock codes, and retry statistics (average attempts, first-try percentage) are tracked in analytics.
+
+## Safety Code Cleanup
+A new `safetyCodeCleanup` procedure is scheduled 1 hour after every check-out as a failsafe. It verifies no lingering RentalAutomator codes remain on any lock. The check-out procedure itself also does an immediate post-deletion sweep and removes any duplicate codes it finds.
+
+## Lock Event Subscription
+The app now subscribes to each lock's `codeChanged` events via `lockCodeChangedHandler`. When a lock reports a code set/deleted/failed event, the handler cross-references it against a `pendingLockOperations` map to confirm or flag the operation asynchronously.
+
+## Security Hardening
+- **HTTPS enforcement**: Calendar URLs must use HTTPS; HTTP is rejected.
+- **Guest name sanitization**: `sanitizeGuestName` strips non-alphanumeric characters and caps length at 20 characters.
+- **Door code validation**: `isValidDoorCode` requires 4-8 numeric digits.
+- **Code masking**: Debug logs show only the last 2 digits of door codes (`maskCode`).
+- **URL / PII protection**: The raw calendar URL and iCal data are no longer logged.
+
+## Calendar Fetch Resilience
+- **Caching**: The last successful calendar parse is stored in `state.iCalDictPrevious`. If a fetch fails, the cached data is used as a fallback and a notification is sent.
+- **Rate limiting**: A 5-minute minimum interval (`CALENDAR_FETCH_MIN_INTERVAL`) prevents excessive API calls. Debug mode and manual tests bypass the limit.
+
+## Analytics Dashboard
+A new **Analytics** section in the UI displays an HTML table of success/failure counts and rates for check-ins, check-outs, lock programming, and lock code deletion. It also shows retry statistics (average attempts, first-try percentage), timestamps of the last check-in/check-out, and a toggleable list of the 20 most recent events.
+
+## Configuration Validation
+`validateConfiguration` runs on every save and checks for: HTTPS on the calendar URL, required modes being set, valid prep minutes, lock capabilities (`setCode` / `deleteCode`), and valid time-offset ranges. Errors are logged and stored in `state.configurationValid`.
+
+## State Migration
+A versioned migration system (`migrateState`) runs on install and update. It inspects `state.appVersion` and applies incremental migrations (currently v1 -> v2: adds `recentEvents`, `pendingLockOperations`, `configurationValid`). Future upgrades can add new migration blocks without breaking existing installs.
+
+## Dynamic Page UI
+The preferences page was converted from a static `page()` declaration to a `dynamicPage` method (`mainPage()`). This allows button labels to update (e.g., a single toggle button instead of separate enable/disable buttons), conditional sections to render properly, and analytics to refresh on each page load.
+
+## Shared Check-In Logic
+The original code duplicated nearly identical logic in `checkinProcedure` and `checkinPrepProcedure`. RentalLock extracts the common flow into `processCheckinEvent(mode, forceOverride, programLock)` which both procedures call with different arguments.
+
+## Lock Code Naming
+Codes are now named `"RentalAutomator {GuestName}"` instead of just `"RentalAutomator"`, making it easier to identify which guest a code belongs to in the lock's code list. If the Guest Name is not availble it is left blank.
+
+## Improved Code Slot Search
+`findNextAvailableCodePosition` now iterates positions 1 through `maxCodes` looking for the first unused slot (gap-aware), rather than assuming codes are contiguous. It also handles locks that don't report `maxCodes` by defaulting to 30.
+
+## atomicState for Thread Safety
+`state.enabled` was renamed to `atomicState.automationEnabled`, and the calendar-test flags moved to `atomicState`, to prevent race conditions in Hubitat's concurrent execution model.
+
+## Misc Cleanup
+- `debugLog` helper replaces repetitive `if(debugMode) log.debug` guards throughout.
+- `convertTimeToCron` gained a `minutesToAdd` parameter; a new `convertDateToCron` converts Date objects directly.
+- `extractProperty` regex broadened from `"propertyName:(value)\r?\n"` to `"propertyName...:\h*(word)"` for more flexible iCal parsing.
+- Dead functions (`checkinToday`, `checkoutToday`, `iCalToMapListAirBnB`) removed.
+
+---
+
 # Hubitat Rental Automator by [Dan Healy](https://thedanhealy.com)
 
 This Hubitat app provides a direct integration with AirBNB and control over changing modes and programming door locks **without the use of any other services, such as the Maker API and/or other applications**. 
